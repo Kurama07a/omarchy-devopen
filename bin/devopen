@@ -91,10 +91,15 @@ menu_row() { # menu_row <icon> <label> <subtext>
   printf '%s\t%s\t%s' "$(flatten "$1")" "$(flatten "$2")" "$(flatten "$3")"
 }
 
+# These two deliberately treat "~" as a literal character: config files and the
+# typed-path prompt carry it as text, and it is this function's job to turn it
+# into $HOME and back. The tildes below are data, not something to be expanded,
+# so SC2088 is suppressed rather than obeyed.
 expand_path() { # ~ and $HOME-relative -> absolute
   local p="$1"
   case "$p" in
     "~") p="$HOME" ;;
+    # shellcheck disable=SC2088
     "~/"*) p="$HOME/${p#\~/}" ;;
   esac
   printf '%s' "$p"
@@ -102,7 +107,9 @@ expand_path() { # ~ and $HOME-relative -> absolute
 
 tilde_path() {
   local p="$1"
+  # shellcheck disable=SC2088
   if [[ $p == "$HOME" ]]; then printf '~'
+  # shellcheck disable=SC2088
   elif [[ $p == "$HOME"/* ]]; then printf '~/%s' "${p#"$HOME"/}"
   else printf '%s' "$p"
   fi

@@ -167,6 +167,7 @@ group "paths"
   new_env "$(basic_config)"
   load_lib
   assert_eq "expand_path ~"            "$HOME"            "$(expand_path '~')"
+  # shellcheck disable=SC2088  # literal tilde is the input under test
   assert_eq "expand_path ~/x"          "$HOME/x"          "$(expand_path '~/x')"
   assert_eq "expand_path absolute"     "/etc/hosts"       "$(expand_path '/etc/hosts')"
   assert_eq "expand_path relative"     "rel/path"         "$(expand_path 'rel/path')"
@@ -174,6 +175,7 @@ group "paths"
   assert_eq "expand_path no eval"      '$(id)'            "$(expand_path '$(id)')"
   assert_eq "expand_path empty"        ""                 "$(expand_path '')"
   assert_eq "tilde_path home"          "~"                "$(tilde_path "$HOME")"
+  # shellcheck disable=SC2088  # literal tilde is the expected output
   assert_eq "tilde_path under home"    "~/Projects/x"     "$(tilde_path "$HOME/Projects/x")"
   assert_eq "tilde_path outside"       "/opt/thing"       "$(tilde_path '/opt/thing')"
   assert_eq "tilde_path homelike"      "/home/other/x"    "$(tilde_path '/home/other/x')"
@@ -605,6 +607,7 @@ o.bind("SUPER + Z", "My own devopen menu alias", "devopen menu")
 EOF
   cp "$FAKE/.config/hypr/bindings.lua" "$TMP/bindings.orig"
 
+  # shellcheck disable=SC2120  # both helpers are called with and without args
   inst() { env HOME="$FAKE" XDG_BIN_HOME="$FAKE/.local/bin" \
                 XDG_DATA_HOME="$FAKE/.local/share" XDG_CONFIG_HOME="$FAKE/.config" \
                 bash "$REPO/install.sh" "$@" 2>&1; }
