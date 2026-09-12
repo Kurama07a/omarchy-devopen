@@ -1,0 +1,401 @@
+#!/bin/bash
+# devopen - open an editor, coding agent, or preset combo in any directory,
+# driven by the native Omarchy menu.
+#
+# The menu is Omarchy's own `select` mode (omarchy-menu-select), not a static
+# JSONC submenu: custom `provider:` names are not supported by the shipped
+# menu plugin, and select mode gives a live list plus fuzzy search for free.
+
+set -uo pipefail
+
+VERSION="1.0.0"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/devopen"
+CONFIG_FILE="$CONFIG_DIR/config.json"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/devopen"
+CACHE_FILE="$CACHE_DIR/dirs.tsv"
+
+# Where the shipped default config is looked up when the user has none yet.
+# The install puts a copy in XDG data; the repo path is the fallback for
+# running straight out of a checkout.
+default_config_path() {
+  local c
+  for c in \
+    "${DEVOPEN_DEFAULT_CONFIG-}" \
+    "${XDG_DATA_HOME:-$HOME/.local/share}/devopen/config.default.json" \
+    "$(dirname "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")")/config/config.default.json" \
+    "/usr/share/devopen/config.default.json"
+  do
+    [[ -n $c && -f $c ]] && { printf '%s' "$c"; return 0; }
+  done
+  return 1
+}
+
+TAB=$'\t'
+
+die() { printf 'devopen: %s\n' "$*" >&2; exit 1; }
+
+notify() {
+  if command -v omarchy-notification-send >/dev/null 2>&1; then
+    omarchy-notification-send "devopen" "$*" >/dev/null 2>&1 || true
+  else
+    printf 'devopen: %s\n' "$*" >&2
+  fi
+}
+
+need() { command -v "$1" >/dev/null 2>&1; }
+
+# ---------------------------------------------------------------- config ----
+
+ensure_config() {
+  [[ -f $CONFIG_FILE ]] && return 0
+  mkdir -p "$CONFIG_DIR"
+  local src
+  if src=$(default_config_path); then
+    cp "$src" "$CONFIG_FILE"
+  else
+    printf '{"scan":{"roots":[{"path":"~","depth":1}]},"tools":{},"presets":{}}\n' >"$CONFIG_FILE"
+  fi
+}
+
+cfg() { # cfg <jq filter> [default]
+  local out
+  out=$(jq -r "$1 // empty" "$CONFIG_FILE" 2>/dev/null)
+  [[ -n $out ]] && printf '%s' "$out" || printf '%s' "${2-}"
+}
+
+expand_path() { # ~ and $HOME-relative -> absolute
+  local p="$1"
+  case "$p" in
+    "~") p="$HOME" ;;
+    "~/"*) p="$HOME/${p#\~/}" ;;
+  esac
+  printf '%s' "$p"
+}
+
+tilde_path() {
+  local p="$1"
+  if [[ $p == "$HOME" ]]; then printf '~'
+  elif [[ $p == "$HOME"/* ]]; then printf '~/%s' "${p#"$HOME"/}"
+  else printf '%s' "$p"
+  fi
+}
+
+# ----------------------------------------------------------- directories ----
+
+ignore_args() {
+  local pat
+  while IFS= read -r pat; do
+    [[ -n $pat ]] && printf '%s\0%s\0' "-E" "$pat"
+  done < <(jq -r '.scan.ignore[]? // empty' "$CONFIG_FILE" 2>/dev/null)
+}
+
+scan_fresh() {
+  local -a ign=()
+  mapfile -d '' -t ign < <(ignore_args)
+
+  local use_git use_all
+  use_git=$(cfg '.scan.gitRepos' true)
+  use_all=$(cfg '.scan.allDirs' true)
+
+  # 1. pinned
+  local p abs
+  while IFS= read -r p; do
+    [[ -z $p ]] && continue
+    abs=$(expand_path "$p")
+    [[ -d $abs ]] && printf 'pinned\t%s\n' "${abs%/}"
+  done < <(jq -r '.pinned[]? // empty' "$CONFIG_FILE" 2>/dev/null)
+
+  # 2. zoxide frecency
+  if [[ $(cfg '.scan.zoxide' true) == true ]] && need zoxide; then
+    local limit; limit=$(cfg '.scan.zoxideLimit' 40)
+    while IFS= read -r p; do
+      [[ -d $p ]] && printf 'recent\t%s\n' "${p%/}"
+    done < <(zoxide query -l 2>/dev/null | head -n "$limit")
+  fi
+
+  # 3 + 4. git repos, then plain dirs, per configured root
+  local root depth
+  while IFS=$'\t' read -r root depth; do
+    [[ -z $root ]] && continue
+    root=$(expand_path "$root")
+    [[ -d $root ]] || continue
+    depth=${depth:-2}
+
+    printf 'dir\t%s\n' "${root%/}"
+
+    if [[ $use_git == true ]] && need fd; then
+      fd --absolute-path --hidden --type d --max-depth "$((depth + 1))" \
+         --glob '.git' "$root" 2>/dev/null \
+        | sed -e 's#/*$##' -e 's#/\.git$##' \
+        | while IFS= read -r p; do [[ -n $p ]] && printf 'git\t%s\n' "$p"; done
+    fi
+
+    if [[ $use_all == true ]] && need fd; then
+      fd --absolute-path --type d --max-depth "$depth" "${ign[@]}" . "$root" 2>/dev/null \
+        | sed -e 's#/*$##' \
+        | while IFS= read -r p; do [[ -n $p ]] && printf 'dir\t%s\n' "$p"; done
+    fi
+  done < <(jq -r '.scan.roots[]? | [.path, (.depth // 2 | tostring)] | @tsv' "$CONFIG_FILE" 2>/dev/null)
+}
+
+# Cached because the fd sweep is the only slow part. The cache is rebuilt when
+# it ages past scan.cacheTtl, so a repo cloned a moment ago shows up shortly.
+scan_dirs() {
+  local ttl age
+  ttl=$(cfg '.scan.cacheTtl' 120)
+  mkdir -p "$CACHE_DIR"
+
+  if [[ ${1-} != "--force" && -s $CACHE_FILE ]]; then
+    age=$(( $(date +%s) - $(stat -c %Y "$CACHE_FILE" 2>/dev/null || echo 0) ))
+    if (( age < ttl )); then
+      cat "$CACHE_FILE"
+      return 0
+    fi
+  fi
+
+  scan_fresh | awk -F'\t' '!seen[$2]++' >"$CACHE_FILE.tmp" 2>/dev/null
+  mv -f "$CACHE_FILE.tmp" "$CACHE_FILE"
+  cat "$CACHE_FILE"
+}
+
+# --------------------------------------------------------------- launching --
+
+tool_field() { jq -r --arg k "$1" --arg f "$2" '.tools[$k][$f] // empty' "$CONFIG_FILE" 2>/dev/null; }
+preset_exists() { [[ -n $(jq -r --arg k "$1" '.presets[$k] // empty' "$CONFIG_FILE" 2>/dev/null) ]]; }
+tool_exists() { [[ -n $(jq -r --arg k "$1" '.tools[$k] // empty' "$CONFIG_FILE" 2>/dev/null) ]]; }
+
+# The binary a tool needs, so the menu can hide tools that are not installed.
+tool_binary() {
+  local cmd; cmd=$(tool_field "$1" command)
+  printf '%s' "${cmd%% *}"
+}
+
+tool_available() {
+  local bin; bin=$(tool_binary "$1")
+  [[ -z $bin ]] && return 1
+  [[ $bin == \$* ]] && return 0
+  need "$bin"
+}
+
+launch_tool() { # launch_tool <toolKey> <absDir>
+  local key="$1" dir="$2" type cmd appid q
+  type=$(tool_field "$key" type); type=${type:-gui}
+  cmd=$(tool_field "$key" command)
+  appid=$(tool_field "$key" appId)
+  [[ -z $cmd ]] && { notify "Unknown tool: $key"; return 1; }
+
+  q=$(printf '%q' "$dir")
+  cmd=${cmd//\{dir\}/$q}
+
+  # uwsm-app hands the command to a daemon over a pipe, so the caller's cwd is
+  # never inherited. Every launch cd's inside its own shell instead.
+  local -a argv
+  if [[ $type == "tui" ]]; then
+    [[ -z $appid ]] && appid="org.omarchy.$key"
+    argv=(setsid omarchy-launch-tui --app-id="$appid" bash -lc "cd $q && exec $cmd")
+  else
+    argv=(setsid uwsm-app -- bash -lc "cd $q && exec $cmd")
+  fi
+
+  if [[ -n ${DEVOPEN_DRY_RUN-} ]]; then
+    printf '%q ' "${argv[@]}"; printf '\n'
+    return 0
+  fi
+
+  "${argv[@]}" >/dev/null 2>&1 &
+  disown 2>/dev/null || true
+}
+
+open_target() { # open_target <toolOrPresetKey> <dir>
+  local key="$1" dir
+  dir=$(expand_path "$2")
+  [[ -d $dir ]] || die "not a directory: $dir"
+
+  if preset_exists "$key"; then
+    local step first=1
+    while IFS= read -r step; do
+      [[ -z $step ]] && continue
+      (( first )) || sleep 0.35
+      first=0
+      launch_tool "$step" "$dir"
+    done < <(jq -r --arg k "$key" '.presets[$k].steps[]? // empty' "$CONFIG_FILE" 2>/dev/null)
+    return 0
+  fi
+
+  tool_exists "$key" || die "no such tool or preset: $key"
+  launch_tool "$key" "$dir"
+}
+
+# ------------------------------------------------------------------ menus ---
+
+# Rows are "<glyph>\t<label>\t<subtext>"; the menu returns "<label>\t<subtext>"
+# so the subtext doubles as the stable key for rows that share a label.
+pick_tool() {
+  local rows width
+  width=$(cfg '.menu.toolWidth' 440)
+
+  rows=$(
+    jq -r '
+      [ (.tools   | to_entries[] | {k:.key, v:.value, kind:"tool"}),
+        (.presets | to_entries[] | {k:.key, v:.value, kind:"preset"}) ][]
+      | [ (.v.icon // ""), (.v.label // .k), (.v.description // ""), .k, .kind ]
+      | @tsv' "$CONFIG_FILE" 2>/dev/null
+  )
+
+  local icon label desc key kind step ok
+  local -a out=()
+  local -A bykey=()
+  while IFS=$'\t' read -r icon label desc key kind; do
+    [[ -z $key ]] && continue
+    if [[ $kind == "tool" ]]; then
+      tool_available "$key" || continue
+    else
+      # A preset is offered only when every step it needs is installed.
+      ok=1
+      while IFS= read -r step; do
+        [[ -z $step ]] && continue
+        tool_available "$step" || ok=0
+      done < <(jq -r --arg k "$key" '.presets[$k].steps[]? // empty' "$CONFIG_FILE" 2>/dev/null)
+      (( ok )) || continue
+    fi
+    [[ -z $desc ]] && desc="$key"
+    out+=("${icon}${TAB}${label}${TAB}${desc}")
+    bykey["${label}${TAB}${desc}"]="$key"
+  done <<<"$rows"
+
+  (( ${#out[@]} )) || { notify "No tools available. Check $CONFIG_FILE"; return 1; }
+
+  local sel
+  sel=$(printf '%s\n' "${out[@]}" | omarchy-menu-select "Open what?" -- --width "$width") || return 1
+  [[ -z $sel ]] && return 1
+  printf '%s' "${bykey[$sel]-}"
+}
+
+pick_dir() {
+  local width height kind path label icon
+  local -a out=()
+  width=$(cfg '.menu.dirWidth' 560)
+  height=$(cfg '.menu.dirMaxHeight' 0)
+
+  while IFS=$'\t' read -r kind path; do
+    [[ -z $path ]] && continue
+    label=$(basename "$path")
+    case "$kind" in
+      pinned) icon="󰐄" ;;
+      recent) icon="󰋚" ;;
+      git)    icon="󰊢" ;;
+      *)      icon="󰉋" ;;
+    esac
+    out+=("${icon}${TAB}${label}${TAB}$(tilde_path "$path")")
+  done < <(scan_dirs)
+
+  out+=("󰌪${TAB}Type a path…${TAB}enter any directory by hand")
+
+  local sel
+  local -a args=(--width "$width")
+  (( height > 0 )) && args+=(--height "$height")
+  sel=$(printf '%s\n' "${out[@]}" | omarchy-menu-select "Where?" -- "${args[@]}") || return 1
+  [[ -z $sel ]] && return 1
+
+  local subtext="${sel#*$TAB}"
+  if [[ $sel == "Type a path…"* ]]; then
+    subtext=$(omarchy-menu-input "Directory" --width "$width") || return 1
+  fi
+  [[ -z $subtext ]] && return 1
+  expand_path "$subtext"
+}
+
+cmd_menu() {
+  local tool dir
+  tool=$(pick_tool) || exit 0
+  [[ -z $tool ]] && exit 0
+  dir=$(pick_dir) || exit 0
+  [[ -z $dir ]] && exit 0
+
+  if [[ ! -d $dir ]]; then
+    notify "No such directory: $dir"
+    exit 1
+  fi
+  open_target "$tool" "$dir"
+}
+
+# Directory first, then what to open in it - same pieces, reversed.
+cmd_menu_reverse() {
+  local tool dir
+  dir=$(pick_dir) || exit 0
+  [[ -z $dir ]] && exit 0
+  tool=$(pick_tool) || exit 0
+  [[ -z $tool ]] && exit 0
+  open_target "$tool" "$dir"
+}
+
+# ------------------------------------------------------------------- misc ---
+
+cmd_doctor() {
+  printf 'devopen %s\n' "$VERSION"
+  printf 'config:  %s %s\n' "$CONFIG_FILE" "$([[ -f $CONFIG_FILE ]] && echo '(ok)' || echo '(MISSING)')"
+  jq -e . "$CONFIG_FILE" >/dev/null 2>&1 || printf '  !! config is not valid JSON\n'
+  printf 'cache:   %s\n' "$CACHE_FILE"
+
+  printf '\ndependencies:\n'
+  local c
+  for c in jq fd omarchy-menu-select omarchy-menu-input omarchy-launch-tui uwsm-app zoxide; do
+    printf '  %-22s %s\n' "$c" "$(command -v "$c" || echo 'MISSING')"
+  done
+
+  printf '\nroots:\n'
+  local root depth abs
+  while IFS=$'\t' read -r root depth; do
+    [[ -z $root ]] && continue
+    abs=$(expand_path "$root")
+    printf '  %-28s depth=%-3s %s\n' "$root" "$depth" "$([[ -d $abs ]] && echo ok || echo missing)"
+  done < <(jq -r '.scan.roots[]? | [.path, (.depth // 2 | tostring)] | @tsv' "$CONFIG_FILE" 2>/dev/null)
+
+  printf '\ntools:\n'
+  local k
+  while IFS= read -r k; do
+    [[ -z $k ]] && continue
+    printf '  %-14s %-6s %s\n' "$k" "$(tool_field "$k" type)" \
+      "$(tool_available "$k" && echo available || echo "missing: $(tool_binary "$k")")"
+  done < <(jq -r '.tools | keys[]?' "$CONFIG_FILE" 2>/dev/null)
+
+  printf '\ndirectories found: %s\n' "$(scan_dirs --force | wc -l)"
+}
+
+usage() {
+  cat <<USAGE
+devopen $VERSION - open an editor, agent, or preset in any directory.
+
+Usage:
+  devopen [menu]            Pick what to open, then where (default)
+  devopen where             Pick where first, then what
+  devopen open <what> <dir> Open directly, e.g. devopen open claude ~/Projects/app
+  devopen dirs              Print the discovered directories
+  devopen tools             Print configured tools and presets
+  devopen sync              Rebuild the directory cache now
+  devopen config            Edit the config file
+  devopen doctor            Show config, dependencies and what was found
+  devopen help
+
+Config: $CONFIG_FILE
+USAGE
+}
+
+# ------------------------------------------------------------------- main ---
+
+need jq || die "jq is required"
+ensure_config
+
+case "${1:-menu}" in
+  menu|"")      cmd_menu ;;
+  where)        cmd_menu_reverse ;;
+  open)         shift; (( $# >= 2 )) || die "usage: devopen open <tool|preset> <dir>"; open_target "$1" "$2" ;;
+  dirs)         scan_dirs "${2-}" | while IFS=$'\t' read -r k p; do printf '%-7s %s\n' "$k" "$p"; done ;;
+  tools)        jq -r '"tools:", (.tools|to_entries[]|"  \(.key)\t\(.value.label // "")"), "", "presets:", (.presets|to_entries[]|"  \(.key)\t\(.value.label // "") [\(.value.steps|join(" + "))]")' "$CONFIG_FILE" ;;
+  sync)         scan_dirs --force >/dev/null && echo "devopen: cached $(wc -l <"$CACHE_FILE") directories" ;;
+  config)       exec "${EDITOR:-omarchy-launch-editor}" "$CONFIG_FILE" ;;
+  doctor)       cmd_doctor ;;
+  version|--version|-v) echo "devopen $VERSION" ;;
+  help|--help|-h) usage ;;
+  *)            die "unknown command: $1 (try 'devopen help')" ;;
+esac

@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "prakhar.devopen",
+  "name": "Dev Open",
+  "version": "1.0.0",
+  "author": "Prakhar Shukla",
+  "license": "MIT",
+  "description": "Open VS Code, Claude Code, Codex, Neovim, or a saved preset combo in any project directory, picked through the native Omarchy menu.",
+  "kinds": ["bar-widget"],
+  "activation": "on-demand",
+  "entryPoints": { "barWidget": "BarWidget.qml" },
+  "barWidget": {
+    "displayName": "Dev Open",
+    "description": "Pick a tool and a project directory, then launch. Right-click to pick the directory first.",
+    "category": "Productivity",
+    "defaultSection": "left",
+    "allowMultiple": false,
+    "aliases": ["devopen", "open", "project", "editor", "agent", "claude", "codex", "vscode", "workspace"]
+  }
+}
