@@ -95,21 +95,20 @@ menu_row() { # menu_row <icon> <label> <subtext>
 # typed-path prompt carry it as text, and it is this function's job to turn it
 # into $HOME and back. The tildes below are data, not something to be expanded,
 # so SC2088 is suppressed rather than obeyed.
+# shellcheck disable=SC2088  # the tildes below are literal text, by design
 expand_path() { # ~ and $HOME-relative -> absolute
   local p="$1"
   case "$p" in
     "~") p="$HOME" ;;
-    # shellcheck disable=SC2088
     "~/"*) p="$HOME/${p#\~/}" ;;
   esac
   printf '%s' "$p"
 }
 
+# shellcheck disable=SC2088  # emits a literal tilde for display, by design
 tilde_path() {
   local p="$1"
-  # shellcheck disable=SC2088
   if [[ $p == "$HOME" ]]; then printf '~'
-  # shellcheck disable=SC2088
   elif [[ $p == "$HOME"/* ]]; then printf '~/%s' "${p#"$HOME"/}"
   else printf '%s' "$p"
   fi
@@ -448,9 +447,11 @@ USAGE
 
 # ------------------------------------------------------------------- main ---
 
-# tests/run.sh sources this file to exercise the functions directly.
+# tests/run.sh sources this file to exercise the functions directly. `return`
+# only works when sourced; if the flag is set on a direct run, stop anyway
+# rather than falling through into the command dispatch below.
 if [[ -n ${DEVOPEN_LIB_ONLY-} ]]; then
-  return 0 2>/dev/null || true
+  return 0 2>/dev/null || exit 0
 fi
 
 need jq || die "jq is required"

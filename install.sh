@@ -89,7 +89,9 @@ if ((WITH_BAR)); then
     fi
   fi
 
-  command -v omarchy-shell >/dev/null 2>&1 && omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
+  if command -v omarchy-shell >/dev/null 2>&1; then
+    omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
+  fi
 fi
 
 # --- 4. keybinding -----------------------------------------------------------
