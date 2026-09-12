@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq fd-find shellcheck
+          sudo ln -sf "$(command -v fdfind)" /usr/local/bin/fd
+
+      - name: Shellcheck
+        run: shellcheck -S warning bin/devopen install.sh uninstall.sh tests/run.sh
+
+      - name: Validate manifest
+        run: |
+          jq -e '.schemaVersion == 1' manifest.json
+          jq -e 'has("id") and has("name") and has("version") and has("kinds") and has("entryPoints")' manifest.json
+          test -f "$(jq -r '.entryPoints.barWidget' manifest.json)"
+          # The shell refuses a plugin folder containing symlinks.
+          test -z "$(find . -name .git -prune -o -type l -print -quit)"
+
+      - name: Validate default config
+        run: jq -e . config/config.default.json
+
+      - name: Test suite
+        run: ./tests/run.sh

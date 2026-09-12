@@ -1,10 +1,11 @@
 {
   "schemaVersion": 1,
-  "id": "prakhar.devopen",
+  "id": "io.github.kurama07a.devopen",
   "name": "Dev Open",
   "version": "1.0.0",
   "author": "Prakhar Shukla",
   "license": "MIT",
+  "homepage": "https://github.com/Kurama07a/omarchy-devopen",
   "description": "Open VS Code, Claude Code, Codex, Neovim, or a saved preset combo in any project directory, picked through the native Omarchy menu.",
   "kinds": ["bar-widget"],
   "activation": "on-demand",

@@ -12,7 +12,9 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN_DIR="${XDG_BIN_HOME:-$HOME/.local/bin}"
 DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/devopen"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/devopen"
-PLUGIN_DIR="$HOME/.config/omarchy/plugins/prakhar.devopen"
+PLUGIN_ID="io.github.kurama07a.devopen"
+PLUGINS_ROOT="$HOME/.config/omarchy/plugins"
+PLUGIN_DIR="$PLUGINS_ROOT/$PLUGIN_ID"
 SHELL_JSON="$HOME/.config/omarchy/shell.json"
 BINDINGS="$HOME/.config/hypr/bindings.lua"
 
@@ -64,33 +66,50 @@ fi
 
 # --- 3. Omarchy bar widget ---------------------------------------------------
 if ((WITH_BAR)); then
-  mkdir -p "$(dirname "$PLUGIN_DIR")"
-  ln -sfn "$REPO/plugin/prakhar.devopen" "$PLUGIN_DIR"
-  say "plugin     $PLUGIN_DIR"
+  mkdir -p "$PLUGINS_ROOT"
+
+  if [[ "$REPO" == "$PLUGIN_DIR" ]]; then
+    # Installed with `omarchy plugin add`: this checkout already is the plugin.
+    say "plugin     already in place ($PLUGIN_DIR)"
+  elif [[ -e $PLUGIN_DIR && ! -L $PLUGIN_DIR ]]; then
+    say "plugin     $PLUGIN_DIR exists and is not a link; leaving it alone"
+  else
+    ln -sfn "$REPO" "$PLUGIN_DIR"
+    say "plugin     $PLUGIN_DIR -> $REPO"
+  fi
 
   if [[ -f $SHELL_JSON ]] && command -v jq >/dev/null 2>&1; then
-    if jq -e '[.. | objects | select(.id == "prakhar.devopen")] | length > 0' "$SHELL_JSON" >/dev/null 2>&1; then
+    if jq -e --arg id "$PLUGIN_ID" '[.. | objects | select(.id == $id)] | length > 0' "$SHELL_JSON" >/dev/null 2>&1; then
       say "bar        already in shell.json"
     else
       cp "$SHELL_JSON" "$SHELL_JSON.bak.$(date +%s)"
       tmp=$(mktemp)
-      jq '.bar.layout.left += [{"id":"prakhar.devopen"}]' "$SHELL_JSON" >"$tmp" && mv "$tmp" "$SHELL_JSON"
+      jq --arg id "$PLUGIN_ID" '.bar.layout.left += [{"id":$id}]' "$SHELL_JSON" >"$tmp" && mv "$tmp" "$SHELL_JSON"
       say "bar        added to shell.json left section (backup alongside)"
     fi
   fi
+
+  command -v omarchy-shell >/dev/null 2>&1 && omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
 fi
 
 # --- 4. keybinding -----------------------------------------------------------
+# The block is fenced with markers so uninstall removes exactly what was added
+# here and never a binding you wrote yourself.
+MARK_START="-- >>> devopen (managed by install.sh) >>>"
+MARK_END="-- <<< devopen (managed by install.sh) <<<"
+
 if ((WITH_KEYBINDING)); then
   if [[ -f $BINDINGS ]]; then
-    if grep -q 'devopen menu' "$BINDINGS"; then
+    if grep -qF -e "$MARK_START" "$BINDINGS"; then
       say "keybind    already in bindings.lua"
     else
       cp "$BINDINGS" "$BINDINGS.bak.$(date +%s)"
       {
         echo ""
-        echo "-- devopen: pick a tool (editor / agent / preset), then a project directory."
+        echo "$MARK_START"
+        echo "-- Pick a tool (editor / agent / preset), then a project directory."
         echo "o.bind(\"$KEY\", \"Open project\", \"devopen menu\")"
+        echo "$MARK_END"
       } >>"$BINDINGS"
       say "keybind    $KEY -> devopen menu (backup alongside)"
     fi

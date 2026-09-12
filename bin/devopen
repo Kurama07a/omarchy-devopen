@@ -59,8 +59,36 @@ ensure_config() {
 
 cfg() { # cfg <jq filter> [default]
   local out
-  out=$(jq -r "$1 // empty" "$CONFIG_FILE" 2>/dev/null)
-  [[ -n $out ]] && printf '%s' "$out" || printf '%s' "${2-}"
+  # Not `// empty`: jq's alternative operator treats `false` as absent, which
+  # would silently turn every `"gitRepos": false` back into the default.
+  out=$(jq -r "$1" "$CONFIG_FILE" 2>/dev/null)
+  [[ -n $out && $out != "null" ]] && printf '%s' "$out" || printf '%s' "${2-}"
+}
+
+# Config values that reach an arithmetic context. Bash evaluates array
+# subscripts inside (( )) and $(( )), so a config string like
+# `PIPESTATUS[$(cmd)]` would execute `cmd`. Anything that is not a plain
+# non-negative integer is refused and the default used instead.
+cfg_int() { # cfg_int <jq filter> <default>
+  local out; out=$(cfg "$1" "")
+  if [[ $out =~ ^[0-9]+$ ]]; then printf '%s' "$out"; else printf '%s' "$2"; fi
+}
+
+is_int() { [[ $1 =~ ^[0-9]+$ ]]; }
+
+cfg_bool() { # cfg_bool <jq filter> <default true|false>
+  local out; out=$(cfg "$1" "$2")
+  case "$out" in true|false) printf '%s' "$out" ;; *) printf '%s' "$2" ;; esac
+}
+
+# The menu's row format is tab-delimited and line-based, so a tab, newline or
+# carriage return inside a name would desync the columns. Display fields are
+# flattened; the true value is recovered from a lookup table, never by
+# re-parsing the text the menu hands back.
+flatten() { local s="$1"; s=${s//$'\t'/ }; s=${s//$'\n'/ }; s=${s//$'\r'/ }; printf '%s' "$s"; }
+
+menu_row() { # menu_row <icon> <label> <subtext>
+  printf '%s\t%s\t%s' "$(flatten "$1")" "$(flatten "$2")" "$(flatten "$3")"
 }
 
 expand_path() { # ~ and $HOME-relative -> absolute
@@ -94,8 +122,8 @@ scan_fresh() {
   mapfile -d '' -t ign < <(ignore_args)
 
   local use_git use_all
-  use_git=$(cfg '.scan.gitRepos' true)
-  use_all=$(cfg '.scan.allDirs' true)
+  use_git=$(cfg_bool '.scan.gitRepos' true)
+  use_all=$(cfg_bool '.scan.allDirs' true)
 
   # 1. pinned
   local p abs
@@ -106,8 +134,8 @@ scan_fresh() {
   done < <(jq -r '.pinned[]? // empty' "$CONFIG_FILE" 2>/dev/null)
 
   # 2. zoxide frecency
-  if [[ $(cfg '.scan.zoxide' true) == true ]] && need zoxide; then
-    local limit; limit=$(cfg '.scan.zoxideLimit' 40)
+  if [[ $(cfg_bool '.scan.zoxide' true) == true ]] && need zoxide; then
+    local limit; limit=$(cfg_int '.scan.zoxideLimit' 40)
     while IFS= read -r p; do
       [[ -d $p ]] && printf 'recent\t%s\n' "${p%/}"
     done < <(zoxide query -l 2>/dev/null | head -n "$limit")
@@ -119,7 +147,7 @@ scan_fresh() {
     [[ -z $root ]] && continue
     root=$(expand_path "$root")
     [[ -d $root ]] || continue
-    depth=${depth:-2}
+    is_int "$depth" || depth=2
 
     printf 'dir\t%s\n' "${root%/}"
 
@@ -142,7 +170,7 @@ scan_fresh() {
 # it ages past scan.cacheTtl, so a repo cloned a moment ago shows up shortly.
 scan_dirs() {
   local ttl age
-  ttl=$(cfg '.scan.cacheTtl' 120)
+  ttl=$(cfg_int '.scan.cacheTtl' 120)
   mkdir -p "$CACHE_DIR"
 
   if [[ ${1-} != "--force" && -s $CACHE_FILE ]]; then
@@ -153,7 +181,17 @@ scan_dirs() {
     fi
   fi
 
-  scan_fresh | awk -F'\t' '!seen[$2]++' >"$CACHE_FILE.tmp" 2>/dev/null
+  # Keep only well-formed rows: a kind, a tab, then an absolute path. The path
+  # is everything after the first tab, so a directory whose own name contains a
+  # tab survives intact (`read -r kind path` splits the same way). A name
+  # containing a newline arrives here as split fragments; those have no leading
+  # slash, so they are dropped instead of becoming bogus picker entries.
+  scan_fresh | awk '
+    { i = index($0, "\t"); if (i == 0) next
+      p = substr($0, i + 1)
+      if (substr(p, 1, 1) != "/") next
+      if (seen[p]++) next
+      print }' >"$CACHE_FILE.tmp" 2>/dev/null
   mv -f "$CACHE_FILE.tmp" "$CACHE_FILE"
   cat "$CACHE_FILE"
 }
@@ -232,7 +270,7 @@ open_target() { # open_target <toolOrPresetKey> <dir>
 # so the subtext doubles as the stable key for rows that share a label.
 pick_tool() {
   local rows width
-  width=$(cfg '.menu.toolWidth' 440)
+  width=$(cfg_int '.menu.toolWidth' 440)
 
   rows=$(
     jq -r '
@@ -259,7 +297,11 @@ pick_tool() {
       (( ok )) || continue
     fi
     [[ -z $desc ]] && desc="$key"
-    out+=("${icon}${TAB}${label}${TAB}${desc}")
+    label=$(flatten "$label"); desc=$(flatten "$desc")
+    # Two tools sharing a label and description would be indistinguishable in
+    # what the menu returns; nudge the later one so each row maps to one key.
+    while [[ -n ${bykey["${label}${TAB}${desc}"]-} ]]; do desc="$desc "; done
+    out+=("$(menu_row "$icon" "$label" "$desc")")
     bykey["${label}${TAB}${desc}"]="$key"
   done <<<"$rows"
 
@@ -271,25 +313,34 @@ pick_tool() {
   printf '%s' "${bykey[$sel]-}"
 }
 
+TYPE_A_PATH="Type a path…"
+
 pick_dir() {
-  local width height kind path label icon
+  local width height kind path label shown icon
   local -a out=()
-  width=$(cfg '.menu.dirWidth' 560)
-  height=$(cfg '.menu.dirMaxHeight' 0)
+  local -A bypath=()
+  width=$(cfg_int '.menu.dirWidth' 560)
+  height=$(cfg_int '.menu.dirMaxHeight' 0)
 
   while IFS=$'\t' read -r kind path; do
     [[ -z $path ]] && continue
-    label=$(basename "$path")
+    label=$(flatten "$(basename "$path")")
+    shown=$(flatten "$(tilde_path "$path")")
     case "$kind" in
       pinned) icon="󰐄" ;;
       recent) icon="󰋚" ;;
       git)    icon="󰊢" ;;
       *)      icon="󰉋" ;;
     esac
-    out+=("${icon}${TAB}${label}${TAB}$(tilde_path "$path")")
+    # Distinct directories can flatten to the same display text (one holding a
+    # tab where the other holds a space). Keep each row's key unique so the
+    # selection always resolves to the directory that was actually shown.
+    while [[ -n ${bypath["${label}${TAB}${shown}"]-} ]]; do shown="$shown "; done
+    out+=("$(menu_row "$icon" "$label" "$shown")")
+    bypath["${label}${TAB}${shown}"]="$path"
   done < <(scan_dirs)
 
-  out+=("󰌪${TAB}Type a path…${TAB}enter any directory by hand")
+  out+=("$(menu_row "󰌪" "$TYPE_A_PATH" "enter any directory by hand")")
 
   local sel
   local -a args=(--width "$width")
@@ -297,12 +348,19 @@ pick_dir() {
   sel=$(printf '%s\n' "${out[@]}" | omarchy-menu-select "Where?" -- "${args[@]}") || return 1
   [[ -z $sel ]] && return 1
 
-  local subtext="${sel#*$TAB}"
-  if [[ $sel == "Type a path…"* ]]; then
-    subtext=$(omarchy-menu-input "Directory" --width "$width") || return 1
+  if [[ $sel == "$TYPE_A_PATH"$TAB* ]]; then
+    local typed
+    typed=$(omarchy-menu-input "Directory" --width "$width") || return 1
+    [[ -z $typed ]] && return 1
+    expand_path "$typed"
+    return 0
   fi
-  [[ -z $subtext ]] && return 1
-  expand_path "$subtext"
+
+  # Resolved from the table, never re-parsed out of the returned text, so a
+  # tab inside a directory name cannot point this at a different directory.
+  local real="${bypath[$sel]-}"
+  [[ -z $real ]] && return 1
+  printf '%s' "$real"
 }
 
 cmd_menu() {
@@ -382,6 +440,11 @@ USAGE
 }
 
 # ------------------------------------------------------------------- main ---
+
+# tests/run.sh sources this file to exercise the functions directly.
+if [[ -n ${DEVOPEN_LIB_ONLY-} ]]; then
+  return 0 2>/dev/null || true
+fi
 
 need jq || die "jq is required"
 ensure_config
