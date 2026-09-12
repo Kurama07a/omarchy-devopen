@@ -246,6 +246,18 @@ group "scan"
   assert_contains     "depth 2 includes level 2" "$TREE/plain/nested" "$out"
   assert_not_contains "depth 2 excludes level 3" "$TREE/plain/nested/deep" "$out"
 
+  # in a worktree or submodule .git is a file, not a directory
+  mkdir -p "$TREE/worktree-repo" && echo "gitdir: /elsewhere/.git" >"$TREE/worktree-repo/.git"
+  out=$(run dirs --force)
+  assert_contains "worktree (.git is a file) counts as a repo" \
+    "git" "$(printf '%s\n' "$out" | grep -F "$TREE/worktree-repo")"
+  rm -rf "$TREE/worktree-repo"
+
+  # the root itself being a repo is detected
+  mkdir -p "$TREE/.git"
+  assert_contains "root repo detected" "git" "$(run dirs --force | grep -E "	?$TREE\$|  $TREE\$")"
+  rm -rf "$TREE/.git"
+
   # dedup: a path must appear exactly once
   dupes=$(run dirs | awk '{$1=""; print}' | sort | uniq -d)
   assert_eq "no duplicate paths" "" "$dupes"

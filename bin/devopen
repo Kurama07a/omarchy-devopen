@@ -155,13 +155,26 @@ scan_fresh() {
     [[ -d $root ]] || continue
     is_int "$depth" || depth=2
 
-    printf 'dir\t%s\n' "${root%/}"
+    # The root's own row is emitted with the kind it actually has: dedup keeps
+    # whichever row comes first, so labelling it `dir` up front would stop the
+    # git pass below from ever marking a root that is itself a repository.
+    if [[ $use_git == true && -e "$root/.git" ]]; then
+      printf 'git\t%s\n' "${root%/}"
+    else
+      printf 'dir\t%s\n' "${root%/}"
+    fi
 
     if [[ $use_git == true ]] && need fd; then
-      fd --absolute-path --hidden --type d --max-depth "$((depth + 1))" \
-         --glob '.git' "$root" 2>/dev/null \
-        | sed -e 's#/*$##' -e 's#/\.git$##' \
-        | while IFS= read -r p; do [[ -n $p ]] && printf 'git\t%s\n' "$p"; done
+      # Ask fd only for directories and decide here what is a repository.
+      # Whether `fd` will match `.git` itself depends on its version and its
+      # VCS-ignore rules, and `.git` is a plain file in a worktree or
+      # submodule — testing for it directly is right in every one of those
+      # cases and the same on every fd.
+      fd --absolute-path --type d --max-depth "$depth" "${ign[@]}" . "$root" 2>/dev/null \
+        | sed -e 's#/*$##' \
+        | while IFS= read -r p; do
+            [[ -n $p && -e "$p/.git" ]] && printf 'git\t%s\n' "$p"
+          done
     fi
 
     if [[ $use_all == true ]] && need fd; then
