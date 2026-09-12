@@ -69,6 +69,23 @@ assert_no_file() {
   if [[ ! -e $2 ]]; then ok "$1"; else no "$1" "file should not exist: $2"; fi
 }
 
+# Launches are backgrounded, so a fixed sleep races on a loaded machine (CI
+# caught exactly that). Wait for the expected result instead, giving up only
+# after a generous timeout. wait_lines <file> <count> [tenths, default 150]
+wait_lines() {
+  local f="$1" want="$2" ticks="${3:-150}" i
+  for (( i = 0; i < ticks; i++ )); do
+    (( $(grep -c . "$f" 2>/dev/null || echo 0) >= want )) && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+# "Nothing should happen" assertions have no event to wait for, so they still
+# need a settle window — but a short fixed one is correct there.
+# shellcheck disable=SC2120  # the override argument is deliberate spare capacity
+settle() { sleep "${1:-0.6}"; }
+
 # ---------------------------------------------------------------- fixtures --
 
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/devopen-tests.XXXXXX") || exit 1
@@ -339,22 +356,22 @@ group "launch"
   new_env "$(basic_config)"
   : >"$LOG"; rm -f "$TMP/cwd.log" "$TMP/arg.log"
 
-  "$DEVOPEN" open rec "$TREE/plain" >/dev/null 2>&1; sleep 0.6
+  "$DEVOPEN" open rec "$TREE/plain" >/dev/null 2>&1; wait_lines "$TMP/cwd.log" 1
   assert_contains "tui launch lands in dir"  "$TREE/plain" "$(cat "$TMP/cwd.log" 2>/dev/null)"
   assert_contains "tui launch sets app-id"   "appid=test.rec" "$(cat "$LOG")"
 
   : >"$LOG"; rm -f "$TMP/cwd.log"
-  "$DEVOPEN" open gui "$TREE/plain" >/dev/null 2>&1; sleep 0.6
+  "$DEVOPEN" open gui "$TREE/plain" >/dev/null 2>&1; wait_lines "$TMP/cwd.log" 1
   assert_contains "gui launch goes via uwsm" "GUI" "$(cat "$LOG")"
   assert_contains "gui launch lands in dir"  "$TREE/plain" "$(cat "$TMP/cwd.log" 2>/dev/null)"
 
   rm -f "$TMP/arg.log"
-  "$DEVOPEN" open arg "$TREE/space dir" >/dev/null 2>&1; sleep 0.6
+  "$DEVOPEN" open arg "$TREE/space dir" >/dev/null 2>&1; wait_lines "$TMP/arg.log" 1
   assert_eq "{dir} substituted, spaces intact" "$TREE/space dir" "$(cat "$TMP/arg.log" 2>/dev/null)"
 
   # preset runs every step
   : >"$LOG"; rm -f "$TMP/cwd.log"
-  "$DEVOPEN" open both "$TREE/plain" >/dev/null 2>&1; sleep 1.2
+  "$DEVOPEN" open both "$TREE/plain" >/dev/null 2>&1; wait_lines "$TMP/cwd.log" 2
   assert_eq "preset runs both steps" "2" "$(grep -c . "$TMP/cwd.log" 2>/dev/null || echo 0)"
 
   # errors
@@ -408,7 +425,7 @@ group "security"
            "$TREE/quote'sq\"dq"; do
     "$DEVOPEN" open rec "$d" >/dev/null 2>&1
   done
-  sleep 1.2
+  wait_lines "$TMP/cwd.log" 5
   hostile=$(find "$TREE" "$TMP" . -maxdepth 2 -name 'HOSTILE_*' -type f 2>/dev/null | head -5)
   assert_eq "no command injection via directory name" "" "$hostile"
 
@@ -544,7 +561,7 @@ EOF
   new_env "$(basic_config)"
   : >"$DEVOPEN_ROWS_FILE"; rm -f "$TMP/cwd.log"
   DEVOPEN_PICK="Rec" DEVOPEN_PICK_DIR="plain" "$DEVOPEN" menu >/dev/null 2>&1
-  sleep 0.6
+  wait_lines "$TMP/cwd.log" 1
   assert_contains "menu flow launches chosen tool in chosen dir" \
     "$TREE/plain" "$(cat "$TMP/cwd.log" 2>/dev/null)"
 
@@ -563,7 +580,7 @@ EOF
   if [[ -d $tabdir ]]; then
     : >"$DEVOPEN_ROWS_FILE"; rm -f "$TMP/cwd.log"
     DEVOPEN_PICK="Rec" DEVOPEN_PICK_DIR="tab name" "$DEVOPEN" menu >/dev/null 2>&1
-    sleep 0.6
+    wait_lines "$TMP/cwd.log" 1
     got=$(cat "$TMP/cwd.log" 2>/dev/null)
     assert_eq "tab-named dir resolves to the real path" "$tabdir" "$got"
   else
@@ -573,33 +590,33 @@ EOF
   # cancelling the tool picker must launch nothing
   rm -f "$TMP/cwd.log"
   DEVOPEN_PICK="__nothing__" DEVOPEN_PICK_DIR="plain" "$DEVOPEN" menu >/dev/null 2>&1
-  sleep 0.4
+  settle
   assert_no_file "cancelling tool picker launches nothing" "$TMP/cwd.log"
 
   # cancelling the directory picker must launch nothing
   rm -f "$TMP/cwd.log"
   DEVOPEN_PICK="Rec" DEVOPEN_PICK_DIR="__nothing__" "$DEVOPEN" menu >/dev/null 2>&1
-  sleep 0.4
+  settle
   assert_no_file "cancelling dir picker launches nothing" "$TMP/cwd.log"
 
   # "Type a path…" routes to the input prompt
   rm -f "$TMP/cwd.log"
   DEVOPEN_PICK="Rec" DEVOPEN_PICK_DIR="Type a path…" DEVOPEN_TYPED="$TREE/repo-a" \
     "$DEVOPEN" menu >/dev/null 2>&1
-  sleep 0.6
+  wait_lines "$TMP/cwd.log" 1
   assert_contains "typed path is opened" "$TREE/repo-a" "$(cat "$TMP/cwd.log" 2>/dev/null)"
 
   # a typed path that does not exist is refused, not launched
   rm -f "$TMP/cwd.log"
   DEVOPEN_PICK="Rec" DEVOPEN_PICK_DIR="Type a path…" DEVOPEN_TYPED="/nonexistent-xyz" \
     "$DEVOPEN" menu >/dev/null 2>&1
-  sleep 0.4
+  settle
   assert_no_file "typed nonexistent path launches nothing" "$TMP/cwd.log"
 
   # reverse order flow
   rm -f "$TMP/cwd.log"
   DEVOPEN_PICK="Rec" DEVOPEN_PICK_DIR="repo-a" "$DEVOPEN" where >/dev/null 2>&1
-  sleep 0.6
+  wait_lines "$TMP/cwd.log" 1
   assert_contains "where flow works" "$TREE/repo-a" "$(cat "$TMP/cwd.log" 2>/dev/null)"
 
   rm -f "$STUB/omarchy-menu-select" "$STUB/omarchy-menu-input"
