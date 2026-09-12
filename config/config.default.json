@@ -1,12 +1,23 @@
 {
   "$comment": "devopen configuration. Paths may use ~ for $HOME. Run `devopen config` to edit, `devopen doctor` to validate.",
-
   "scan": {
     "roots": [
-      { "path": "~/Projects", "depth": 2 },
-      { "path": "~/Work", "depth": 2 },
-      { "path": "~/Documents", "depth": 1 },
-      { "path": "~/go/src", "depth": 3 }
+      {
+        "path": "~/Projects",
+        "depth": 2
+      },
+      {
+        "path": "~/Work",
+        "depth": 2
+      },
+      {
+        "path": "~/Documents",
+        "depth": 1
+      },
+      {
+        "path": "~/go/src",
+        "depth": 3
+      }
     ],
     "gitRepos": true,
     "allDirs": true,
@@ -14,33 +25,44 @@
     "zoxideLimit": 40,
     "cacheTtl": 120,
     "ignore": [
-      "node_modules", ".git", ".svn", "target", "dist", "build", "out",
-      ".venv", "venv", "__pycache__", ".cache", ".next", ".nuxt",
-      "vendor", ".gradle", ".idea", ".terraform", "Godeps"
+      "node_modules",
+      ".git",
+      ".svn",
+      "target",
+      "dist",
+      "build",
+      "out",
+      ".venv",
+      "venv",
+      "__pycache__",
+      ".cache",
+      ".next",
+      ".nuxt",
+      "vendor",
+      ".gradle",
+      ".idea",
+      ".terraform",
+      "Godeps"
     ]
   },
-
   "pinned": [],
-
   "menu": {
     "toolWidth": 440,
     "dirWidth": 560,
     "dirMaxHeight": 0
   },
-
   "defaultTool": "code",
-
   "tools": {
     "code": {
       "label": "VS Code",
-      "icon": "󰊡",
+      "icon": "󰨞",
       "description": "Open the folder in VS Code",
       "type": "gui",
       "command": "code {dir}"
     },
     "claude": {
       "label": "Claude Code",
-      "icon": "󰪩",
+      "icon": "󰚩",
       "description": "Coding agent in a terminal",
       "type": "tui",
       "appId": "org.omarchy.agent",
@@ -48,7 +70,7 @@
     },
     "codex": {
       "label": "Codex",
-      "icon": "󰆅",
+      "icon": "󰞷",
       "description": "Coding agent in a terminal",
       "type": "tui",
       "appId": "org.omarchy.agent",
@@ -78,25 +100,33 @@
       "command": "nautilus {dir}"
     }
   },
-
   "presets": {
     "code-claude": {
       "label": "VS Code + Claude",
       "icon": "󱓞",
       "description": "Editor, and Claude in a terminal beside it",
-      "steps": ["code", "claude"]
+      "steps": [
+        "code",
+        "claude"
+      ]
     },
     "code-codex": {
       "label": "VS Code + Codex",
       "icon": "󱓞",
       "description": "Editor, and Codex in a terminal beside it",
-      "steps": ["code", "codex"]
+      "steps": [
+        "code",
+        "codex"
+      ]
     },
     "nvim-claude": {
       "label": "Neovim + Claude",
       "icon": "󱓞",
       "description": "Two terminals: editor and agent",
-      "steps": ["nvim", "claude"]
+      "steps": [
+        "nvim",
+        "claude"
+      ]
     }
   }
 }
