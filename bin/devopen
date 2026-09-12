@@ -8,7 +8,78 @@
 
 set -uo pipefail
 
-VERSION="1.0.0"
+# -------------------------------------------------------------- trust model --
+#
+# Two different kinds of program get run from here, and treating them alike was
+# a real hole:
+#
+#   1. This script's own machinery - jq, fd, sed, awk, setsid, uwsm-app, the
+#      omarchy menu helpers. You never asked for these; they are implementation
+#      detail. Resolving them through an inherited PATH meant a file planted
+#      earlier on that PATH (say ~/.local/bin/jq) would run on an ordinary
+#      widget click. They are now resolved to absolute paths inside an explicit
+#      list of trusted directories, under an environment this script builds
+#      instead of inheriting.
+#
+#   2. The tool you configured - the `command` string out of config.json. That
+#      one is yours. It goes to the session's own app daemon and is launched
+#      with the session environment, exactly as the app launcher would launch
+#      it. Second-guessing where its binaries live buys nothing: config.json
+#      can already name any command at all, so it sits at the same trust level
+#      as your shell profile.
+#
+# The rule: a poisoned PATH must not be able to change *which* program runs. It
+# may still be inherited by the program you explicitly asked for.
+
+# Root-owned directories only. `security.toolPath` in config.json replaces this
+# list, for installs that keep the omarchy helpers somewhere else.
+DEFAULT_TOOL_PATH="/usr/share/omarchy/bin:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
+
+# Kept when the environment is rebuilt below; everything else is dropped -
+# including LD_PRELOAD, LD_LIBRARY_PATH and BASH_ENV, which redirect execution
+# just as effectively as PATH does.
+ENV_KEEP=(
+  HOME USER LOGNAME TERM LANG
+  XDG_CONFIG_HOME XDG_CACHE_HOME XDG_DATA_HOME XDG_RUNTIME_DIR
+  XDG_CURRENT_DESKTOP XDG_SESSION_TYPE
+  WAYLAND_DISPLAY HYPRLAND_INSTANCE_SIGNATURE DISPLAY XAUTHORITY
+  DBUS_SESSION_BUS_ADDRESS
+  EDITOR
+)
+
+# Re-exec once under a closed environment. DEVOPEN_USER_PATH carries the PATH we
+# were called with; it is never used to find anything this script runs, only to
+# answer "is the tool you configured installed?" when building the picker.
+if [[ -z ${DEVOPEN_LIB_ONLY-} && -z ${DEVOPEN_SEALED-} ]]; then
+  _self="${BASH_SOURCE[0]}"
+  [[ $_self == /* ]] || _self="$PWD/$_self"
+
+  # Located without a PATH search, since a PATH search is the thing being fixed.
+  _env=""
+  for _d in /usr/bin /bin /usr/local/bin; do
+    [[ -x $_d/env ]] && { _env="$_d/env"; break; }
+  done
+  [[ -n $_env ]] || { printf 'devopen: no env(1) in a trusted directory\n' >&2; exit 1; }
+
+  _keep=(DEVOPEN_SEALED=1 "DEVOPEN_USER_PATH=${PATH-}" "PATH=$DEFAULT_TOOL_PATH")
+  for _v in "${ENV_KEEP[@]}"; do
+    [[ -n ${!_v+x} ]] && _keep+=("$_v=${!_v}")
+  done
+  # Our own knobs and the locale. None of these can redirect execution, and the
+  # two the seal itself sets are not taken from the caller.
+  for _v in ${!DEVOPEN_@} ${!LC_@}; do
+    [[ $_v == DEVOPEN_SEALED || $_v == DEVOPEN_USER_PATH ]] && continue
+    _keep+=("$_v=${!_v}")
+  done
+
+  exec "$_env" -i "${_keep[@]}" "$_self" "$@"
+fi
+
+# Your PATH, kept for availability checks and for the editor `devopen config`
+# opens - both of which are about your tools, not ours.
+USER_PATH="${DEVOPEN_USER_PATH:-${PATH-}}"
+
+VERSION="1.1.0"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/devopen"
 CONFIG_FILE="$CONFIG_DIR/config.json"
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/devopen"
@@ -34,15 +105,89 @@ TAB=$'\t'
 
 die() { printf 'devopen: %s\n' "$*" >&2; exit 1; }
 
+# ------------------------------------------------------------------ tools ----
+#
+# Every program this script runs for itself is looked up here, once, and kept
+# as an absolute path. The named ones below are the ones worth being explicit
+# about; plain coreutils (cat, mv, head, wc) are still called by name, which is
+# safe because PATH is now the trusted list and nothing else.
+
+# Declared global: tests/run.sh sources this file from inside a function, where
+# a plain `declare` would make the array local to it and vanish on return.
+declare -ga TRUSTED_DIRS=()
+declare -gA BIN=()
+
+set_trusted_dirs() { # set_trusted_dirs <colon-separated list>
+  local d
+  TRUSTED_DIRS=()
+  BIN=()
+  while IFS= read -r d; do
+    [[ $d == /* && -d $d ]] || continue
+    TRUSTED_DIRS+=("$d")
+  done <<<"${1//:/$'\n'}"
+  # What we run and what we search must not drift apart.
+  PATH=$(IFS=:; printf '%s' "${TRUSTED_DIRS[*]}")
+  export PATH
+}
+
+# A bare name, resolved to a regular executable file inside a trusted directory.
+# Anything else - a path, a directory, a non-executable - is not a tool.
+resolve_bin() { # resolve_bin <name>
+  local n="$1" d p
+  [[ -n ${BIN[$n]-} ]] && { printf '%s' "${BIN[$n]}"; return 0; }
+  [[ -n $n && $n != */* ]] || return 1
+  for d in "${TRUSTED_DIRS[@]}"; do
+    p="$d/$n"
+    [[ -f $p && -x $p ]] || continue
+    BIN[$n]="$p"
+    printf '%s' "$p"
+    return 0
+  done
+  return 1
+}
+
+have_bin() { resolve_bin "$1" >/dev/null; }
+
+# Absolute path or a clear failure - never a fallback to whatever PATH offers.
+bin() { # bin <name>
+  local p
+  p=$(resolve_bin "$1") || die "required program not found in trusted path: $1"
+  printf '%s' "$p"
+}
+
 notify() {
-  if command -v omarchy-notification-send >/dev/null 2>&1; then
-    omarchy-notification-send "devopen" "$*" >/dev/null 2>&1 || true
+  local n
+  if n=$(resolve_bin omarchy-notification-send); then
+    "$n" "devopen" "$*" >/dev/null 2>&1 || true
   else
     printf 'devopen: %s\n' "$*" >&2
   fi
 }
 
-need() { command -v "$1" >/dev/null 2>&1; }
+# Resolved once per trusted-path change. Required ones fail loudly; the
+# optional ones are features that simply switch off when absent.
+JQ="" SED="" AWK="" BASH_BIN="" SETSID="" UWSM_APP="" LAUNCH_TUI=""
+MENU_SELECT="" MENU_INPUT="" FD="" ZOXIDE="" TIMEOUT=""
+
+init_bins() {
+  JQ=$(bin jq); SED=$(bin sed); AWK=$(bin awk); BASH_BIN=$(bin bash)
+  SETSID=$(resolve_bin setsid)                    || SETSID=""
+  UWSM_APP=$(resolve_bin uwsm-app)                || UWSM_APP=""
+  LAUNCH_TUI=$(resolve_bin omarchy-launch-tui)    || LAUNCH_TUI=""
+  MENU_SELECT=$(resolve_bin omarchy-menu-select)  || MENU_SELECT=""
+  MENU_INPUT=$(resolve_bin omarchy-menu-input)    || MENU_INPUT=""
+  FD=$(resolve_bin fd)                            || FD=""
+  ZOXIDE=$(resolve_bin zoxide)                    || ZOXIDE=""
+  TIMEOUT=$(resolve_bin timeout)                  || TIMEOUT=""
+}
+
+set_trusted_dirs "$DEFAULT_TOOL_PATH"
+init_bins
+
+# Is a tool *you* configured installed? Answered against your PATH, because
+# your editors and agents usually live in ~/.local/bin or a version manager's
+# shim directory - never in the trusted system list above.
+user_has() { PATH="$USER_PATH" command -v "$1" >/dev/null 2>&1; }
 
 # ---------------------------------------------------------------- config ----
 
@@ -57,11 +202,23 @@ ensure_config() {
   fi
 }
 
+# An install that keeps the omarchy helpers outside the default list can say so
+# in config.json. Deliberately not an environment variable: the environment is
+# what we stopped trusting, while config.json already decides which commands
+# this plugin may launch at all.
+apply_config_tool_path() {
+  local custom
+  custom=$("$JQ" -r '.security.toolPath // empty' "$CONFIG_FILE" 2>/dev/null)
+  [[ -z $custom ]] && return 0
+  set_trusted_dirs "$custom"
+  init_bins
+}
+
 cfg() { # cfg <jq filter> [default]
   local out
   # Not `// empty`: jq's alternative operator treats `false` as absent, which
   # would silently turn every `"gitRepos": false` back into the default.
-  out=$(jq -r "$1" "$CONFIG_FILE" 2>/dev/null)
+  out=$("$JQ" -r "$1" "$CONFIG_FILE" 2>/dev/null)
   [[ -n $out && $out != "null" ]] && printf '%s' "$out" || printf '%s' "${2-}"
 }
 
@@ -120,12 +277,24 @@ ignore_args() {
   local pat
   while IFS= read -r pat; do
     [[ -n $pat ]] && printf '%s\0%s\0' "-E" "$pat"
-  done < <(jq -r '.scan.ignore[]? // empty' "$CONFIG_FILE" 2>/dev/null)
+  done < <("$JQ" -r '.scan.ignore[]? // empty' "$CONFIG_FILE" 2>/dev/null)
+}
+
+# A scan is the one part of this script that can be made to run forever: a very
+# deep tree, a symlink loop, a stalled network mount. Every sweep gets a
+# wall-clock ceiling; without timeout(1) it simply runs unbounded as before.
+SCAN_TIMEOUT=20
+bounded() {
+  if [[ -n $TIMEOUT ]]; then "$TIMEOUT" -k 2 "$SCAN_TIMEOUT" "$@"; else "$@"; fi
 }
 
 scan_fresh() {
   local -a ign=()
   mapfile -d '' -t ign < <(ignore_args)
+
+  local max
+  max=$(cfg_int '.scan.maxDirs' 5000)
+  SCAN_TIMEOUT=$(cfg_int '.scan.timeout' 20)
 
   local use_git use_all
   use_git=$(cfg_bool '.scan.gitRepos' true)
@@ -137,14 +306,14 @@ scan_fresh() {
     [[ -z $p ]] && continue
     abs=$(expand_path "$p")
     [[ -d $abs ]] && printf 'pinned\t%s\n' "${abs%/}"
-  done < <(jq -r '.pinned[]? // empty' "$CONFIG_FILE" 2>/dev/null)
+  done < <("$JQ" -r '.pinned[]? // empty' "$CONFIG_FILE" 2>/dev/null)
 
   # 2. zoxide frecency
-  if [[ $(cfg_bool '.scan.zoxide' true) == true ]] && need zoxide; then
+  if [[ $(cfg_bool '.scan.zoxide' true) == true && -n $ZOXIDE ]]; then
     local limit; limit=$(cfg_int '.scan.zoxideLimit' 40)
     while IFS= read -r p; do
       [[ -d $p ]] && printf 'recent\t%s\n' "${p%/}"
-    done < <(zoxide query -l 2>/dev/null | head -n "$limit")
+    done < <(bounded "$ZOXIDE" query -l 2>/dev/null | head -n "$limit")
   fi
 
   # 3 + 4. git repos, then plain dirs, per configured root
@@ -164,32 +333,35 @@ scan_fresh() {
       printf 'dir\t%s\n' "${root%/}"
     fi
 
-    if [[ $use_git == true ]] && need fd; then
+    if [[ $use_git == true && -n $FD ]]; then
       # Ask fd only for directories and decide here what is a repository.
       # Whether `fd` will match `.git` itself depends on its version and its
       # VCS-ignore rules, and `.git` is a plain file in a worktree or
       # submodule — testing for it directly is right in every one of those
       # cases and the same on every fd.
-      fd --absolute-path --type d --max-depth "$depth" "${ign[@]}" . "$root" 2>/dev/null \
-        | sed -e 's#/*$##' \
+      bounded "$FD" --absolute-path --type d --max-depth "$depth" \
+          --max-results "$max" "${ign[@]}" . "$root" 2>/dev/null \
+        | "$SED" -e 's#/*$##' \
         | while IFS= read -r p; do
             [[ -n $p && -e "$p/.git" ]] && printf 'git\t%s\n' "$p"
           done
     fi
 
-    if [[ $use_all == true ]] && need fd; then
-      fd --absolute-path --type d --max-depth "$depth" "${ign[@]}" . "$root" 2>/dev/null \
-        | sed -e 's#/*$##' \
+    if [[ $use_all == true && -n $FD ]]; then
+      bounded "$FD" --absolute-path --type d --max-depth "$depth" \
+          --max-results "$max" "${ign[@]}" . "$root" 2>/dev/null \
+        | "$SED" -e 's#/*$##' \
         | while IFS= read -r p; do [[ -n $p ]] && printf 'dir\t%s\n' "$p"; done
     fi
-  done < <(jq -r '.scan.roots[]? | [.path, (.depth // 2 | tostring)] | @tsv' "$CONFIG_FILE" 2>/dev/null)
+  done < <("$JQ" -r '.scan.roots[]? | [.path, (.depth // 2 | tostring)] | @tsv' "$CONFIG_FILE" 2>/dev/null)
 }
 
 # Cached because the fd sweep is the only slow part. The cache is rebuilt when
 # it ages past scan.cacheTtl, so a repo cloned a moment ago shows up shortly.
 scan_dirs() {
-  local ttl age
+  local ttl age max
   ttl=$(cfg_int '.scan.cacheTtl' 120)
+  max=$(cfg_int '.scan.maxDirs' 5000)
   mkdir -p "$CACHE_DIR"
 
   if [[ ${1-} != "--force" && -s $CACHE_FILE ]]; then
@@ -205,21 +377,23 @@ scan_dirs() {
   # tab survives intact (`read -r kind path` splits the same way). A name
   # containing a newline arrives here as split fragments; those have no leading
   # slash, so they are dropped instead of becoming bogus picker entries.
-  scan_fresh | awk '
+  # `head` is the last word on how many rows a menu can ever be asked to show,
+  # whatever the roots and depths in the config add up to.
+  scan_fresh | "$AWK" '
     { i = index($0, "\t"); if (i == 0) next
       p = substr($0, i + 1)
       if (substr(p, 1, 1) != "/") next
       if (seen[p]++) next
-      print }' >"$CACHE_FILE.tmp" 2>/dev/null
+      print }' 2>/dev/null | head -n "$max" >"$CACHE_FILE.tmp"
   mv -f "$CACHE_FILE.tmp" "$CACHE_FILE"
   cat "$CACHE_FILE"
 }
 
 # --------------------------------------------------------------- launching --
 
-tool_field() { jq -r --arg k "$1" --arg f "$2" '.tools[$k][$f] // empty' "$CONFIG_FILE" 2>/dev/null; }
-preset_exists() { [[ -n $(jq -r --arg k "$1" '.presets[$k] // empty' "$CONFIG_FILE" 2>/dev/null) ]]; }
-tool_exists() { [[ -n $(jq -r --arg k "$1" '.tools[$k] // empty' "$CONFIG_FILE" 2>/dev/null) ]]; }
+tool_field() { "$JQ" -r --arg k "$1" --arg f "$2" '.tools[$k][$f] // empty' "$CONFIG_FILE" 2>/dev/null; }
+preset_exists() { [[ -n $("$JQ" -r --arg k "$1" '.presets[$k] // empty' "$CONFIG_FILE" 2>/dev/null) ]]; }
+tool_exists() { [[ -n $("$JQ" -r --arg k "$1" '.tools[$k] // empty' "$CONFIG_FILE" 2>/dev/null) ]]; }
 
 # The binary a tool needs, so the menu can hide tools that are not installed.
 tool_binary() {
@@ -228,10 +402,10 @@ tool_binary() {
 }
 
 tool_available() {
-  local bin; bin=$(tool_binary "$1")
-  [[ -z $bin ]] && return 1
-  [[ $bin == \$* ]] && return 0
-  need "$bin"
+  local b; b=$(tool_binary "$1")
+  [[ -z $b ]] && return 1
+  [[ $b == \$* ]] && return 0
+  user_has "$b"
 }
 
 launch_tool() { # launch_tool <toolKey> <absDir>
@@ -244,15 +418,25 @@ launch_tool() { # launch_tool <toolKey> <absDir>
   q=$(printf '%q' "$dir")
   cmd=${cmd//\{dir\}/$q}
 
-  # uwsm-app hands the command to a daemon over a pipe, so the caller's cwd is
-  # never inherited. Every launch cd's inside its own shell instead.
+  # uwsm-app hands the command to the session's app daemon over a pipe, so the
+  # caller's cwd is never inherited. Every launch cd's inside its own shell.
+  #
+  # `bash -c`, not `bash -lc`: sourcing your profile was how a mutated PATH got
+  # in, and it is not needed. The daemon starts the app from the systemd user
+  # environment - the same one the app launcher uses - so your editors and
+  # agents are found exactly where they normally are. A tool that only exists
+  # on a PATH your shell rc builds should be given its full path in config.json;
+  # `devopen doctor` will show it as missing until then.
   local -a argv
   if [[ $type == "tui" ]]; then
     [[ -z $appid ]] && appid="org.omarchy.$key"
-    argv=(setsid omarchy-launch-tui --app-id="$appid" bash -lc "cd $q && exec $cmd")
+    [[ -n $LAUNCH_TUI ]] || { notify "omarchy-launch-tui not found"; return 1; }
+    argv=("$SETSID" "$LAUNCH_TUI" --app-id="$appid" "$BASH_BIN" -c "cd $q && exec $cmd")
   else
-    argv=(setsid uwsm-app -- bash -lc "cd $q && exec $cmd")
+    [[ -n $UWSM_APP ]] || { notify "uwsm-app not found"; return 1; }
+    argv=("$SETSID" "$UWSM_APP" -- "$BASH_BIN" -c "cd $q && exec $cmd")
   fi
+  [[ -n $SETSID ]] || argv=("${argv[@]:1}")
 
   if [[ -n ${DEVOPEN_DRY_RUN-} ]]; then
     printf '%q ' "${argv[@]}"; printf '\n'
@@ -275,7 +459,7 @@ open_target() { # open_target <toolOrPresetKey> <dir>
       (( first )) || sleep 0.35
       first=0
       launch_tool "$step" "$dir"
-    done < <(jq -r --arg k "$key" '.presets[$k].steps[]? // empty' "$CONFIG_FILE" 2>/dev/null)
+    done < <("$JQ" -r --arg k "$key" '.presets[$k].steps[]? // empty' "$CONFIG_FILE" 2>/dev/null)
     return 0
   fi
 
@@ -285,6 +469,15 @@ open_target() { # open_target <toolOrPresetKey> <dir>
 
 # ------------------------------------------------------------------ menus ---
 
+# However many roots, depths and tools a config adds up to, the menu is never
+# handed an unbounded list.
+menu_trim() { # menu_trim <array-name>
+  local -n rows="$1"
+  local cap; cap=$(cfg_int '.menu.maxRows' 500)
+  (( cap > 0 && ${#rows[@]} > cap )) && rows=("${rows[@]:0:cap}")
+  return 0
+}
+
 # Rows are "<glyph>\t<label>\t<subtext>"; the menu returns "<label>\t<subtext>"
 # so the subtext doubles as the stable key for rows that share a label.
 pick_tool() {
@@ -292,7 +485,7 @@ pick_tool() {
   width=$(cfg_int '.menu.toolWidth' 440)
 
   rows=$(
-    jq -r '
+    "$JQ" -r '
       [ (.tools   | to_entries[] | {k:.key, v:.value, kind:"tool"}),
         (.presets | to_entries[] | {k:.key, v:.value, kind:"preset"}) ][]
       | [ (.v.icon // ""), (.v.label // .k), (.v.description // ""), .k, .kind ]
@@ -312,7 +505,7 @@ pick_tool() {
       while IFS= read -r step; do
         [[ -z $step ]] && continue
         tool_available "$step" || ok=0
-      done < <(jq -r --arg k "$key" '.presets[$k].steps[]? // empty' "$CONFIG_FILE" 2>/dev/null)
+      done < <("$JQ" -r --arg k "$key" '.presets[$k].steps[]? // empty' "$CONFIG_FILE" 2>/dev/null)
       (( ok )) || continue
     fi
     [[ -z $desc ]] && desc="$key"
@@ -325,9 +518,11 @@ pick_tool() {
   done <<<"$rows"
 
   (( ${#out[@]} )) || { notify "No tools available. Check $CONFIG_FILE"; return 1; }
+  menu_trim out
 
   local sel
-  sel=$(printf '%s\n' "${out[@]}" | omarchy-menu-select "Open what?" -- --width "$width") || return 1
+  [[ -n $MENU_SELECT ]] || { notify "omarchy-menu-select not found"; return 1; }
+  sel=$(printf '%s\n' "${out[@]}" | "$MENU_SELECT" "Open what?" -- --width "$width") || return 1
   [[ -z $sel ]] && return 1
   printf '%s' "${bykey[$sel]-}"
 }
@@ -359,17 +554,20 @@ pick_dir() {
     bypath["${label}${TAB}${shown}"]="$path"
   done < <(scan_dirs)
 
+  menu_trim out
   out+=("$(menu_row "󰌪" "$TYPE_A_PATH" "enter any directory by hand")")
 
   local sel
   local -a args=(--width "$width")
   (( height > 0 )) && args+=(--height "$height")
-  sel=$(printf '%s\n' "${out[@]}" | omarchy-menu-select "Where?" -- "${args[@]}") || return 1
+  [[ -n $MENU_SELECT ]] || { notify "omarchy-menu-select not found"; return 1; }
+  sel=$(printf '%s\n' "${out[@]}" | "$MENU_SELECT" "Where?" -- "${args[@]}") || return 1
   [[ -z $sel ]] && return 1
 
   if [[ $sel == "$TYPE_A_PATH"$TAB* ]]; then
     local typed
-    typed=$(omarchy-menu-input "Directory" --width "$width") || return 1
+    [[ -n $MENU_INPUT ]] || { notify "omarchy-menu-input not found"; return 1; }
+    typed=$("$MENU_INPUT" "Directory" --width "$width") || return 1
     [[ -z $typed ]] && return 1
     expand_path "$typed"
     return 0
@@ -411,13 +609,29 @@ cmd_menu_reverse() {
 cmd_doctor() {
   printf 'devopen %s\n' "$VERSION"
   printf 'config:  %s %s\n' "$CONFIG_FILE" "$([[ -f $CONFIG_FILE ]] && echo '(ok)' || echo '(MISSING)')"
-  jq -e . "$CONFIG_FILE" >/dev/null 2>&1 || printf '  !! config is not valid JSON\n'
+  "$JQ" -e . "$CONFIG_FILE" >/dev/null 2>&1 || printf '  !! config is not valid JSON\n'
   printf 'cache:   %s\n' "$CACHE_FILE"
 
-  printf '\ndependencies:\n'
-  local c
-  for c in jq fd omarchy-menu-select omarchy-menu-input omarchy-launch-tui uwsm-app zoxide; do
-    printf '  %-22s %s\n' "$c" "$(command -v "$c" || echo 'MISSING')"
+  printf '\ntrusted path (where devopen finds its own tools):\n'
+  # Group-write is the 6th character of `ls -l` mode bits, other-write the 9th.
+  # -L, because /bin and /sbin are symlinks on Arch and a symlink is always 777.
+  local d writable='^.{5}w|^.{8}w'
+  for d in "${TRUSTED_DIRS[@]}"; do
+    # Not enforced, only reported: a trusted directory anyone can write to is
+    # worth knowing about, but on some systems it is also perfectly normal.
+    if [[ $(stat -Lc %A "$d" 2>/dev/null) =~ $writable ]]; then
+      printf '  %-40s !! group- or world-writable\n' "$d"
+    else
+      printf '  %s\n' "$d"
+    fi
+  done
+
+  printf '\ndependencies (resolved inside the trusted path):\n'
+  local c p
+  for c in jq sed awk bash fd omarchy-menu-select omarchy-menu-input \
+           omarchy-launch-tui omarchy-notification-send setsid uwsm-app timeout zoxide; do
+    p=$(resolve_bin "$c") || p="MISSING"
+    printf '  %-28s %s\n' "$c" "$p"
   done
 
   printf '\nroots:\n'
@@ -426,7 +640,7 @@ cmd_doctor() {
     [[ -z $root ]] && continue
     abs=$(expand_path "$root")
     printf '  %-28s depth=%-3s %s\n' "$root" "$depth" "$([[ -d $abs ]] && echo ok || echo missing)"
-  done < <(jq -r '.scan.roots[]? | [.path, (.depth // 2 | tostring)] | @tsv' "$CONFIG_FILE" 2>/dev/null)
+  done < <("$JQ" -r '.scan.roots[]? | [.path, (.depth // 2 | tostring)] | @tsv' "$CONFIG_FILE" 2>/dev/null)
 
   printf '\ntools:\n'
   local k
@@ -434,7 +648,7 @@ cmd_doctor() {
     [[ -z $k ]] && continue
     printf '  %-14s %-6s %s\n' "$k" "$(tool_field "$k" type)" \
       "$(tool_available "$k" && echo available || echo "missing: $(tool_binary "$k")")"
-  done < <(jq -r '.tools | keys[]?' "$CONFIG_FILE" 2>/dev/null)
+  done < <("$JQ" -r '.tools | keys[]?' "$CONFIG_FILE" 2>/dev/null)
 
   printf '\ndirectories found: %s\n' "$(scan_dirs --force | wc -l)"
 }
@@ -464,20 +678,23 @@ USAGE
 # only works when sourced; if the flag is set on a direct run, stop anyway
 # rather than falling through into the command dispatch below.
 if [[ -n ${DEVOPEN_LIB_ONLY-} ]]; then
+  # Read-only: a source must not create a config that was not there.
+  [[ -f $CONFIG_FILE ]] && apply_config_tool_path
   return 0 2>/dev/null || exit 0
 fi
 
-need jq || die "jq is required"
 ensure_config
+apply_config_tool_path
 
 case "${1:-menu}" in
   menu|"")      cmd_menu ;;
   where)        cmd_menu_reverse ;;
   open)         shift; (( $# >= 2 )) || die "usage: devopen open <tool|preset> <dir>"; open_target "$1" "$2" ;;
   dirs)         scan_dirs "${2-}" | while IFS=$'\t' read -r k p; do printf '%-7s %s\n' "$k" "$p"; done ;;
-  tools)        jq -r '"tools:", (.tools|to_entries[]|"  \(.key)\t\(.value.label // "")"), "", "presets:", (.presets|to_entries[]|"  \(.key)\t\(.value.label // "") [\(.value.steps|join(" + "))]")' "$CONFIG_FILE" ;;
+  tools)        "$JQ" -r '"tools:", (.tools|to_entries[]|"  \(.key)\t\(.value.label // "")"), "", "presets:", (.presets|to_entries[]|"  \(.key)\t\(.value.label // "") [\(.value.steps|join(" + "))]")' "$CONFIG_FILE" ;;
   sync)         scan_dirs --force >/dev/null && echo "devopen: cached $(wc -l <"$CACHE_FILE") directories" ;;
-  config)       exec "${EDITOR:-omarchy-launch-editor}" "$CONFIG_FILE" ;;
+  # Your editor, so your PATH - the same reasoning as the tools in config.json.
+  config)       PATH="$USER_PATH" exec "${EDITOR:-omarchy-launch-editor}" "$CONFIG_FILE" ;;
   doctor)       cmd_doctor ;;
   version|--version|-v) echo "devopen $VERSION" ;;
   help|--help|-h) usage ;;

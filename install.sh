@@ -110,14 +110,16 @@ if ((WITH_KEYBINDING)); then
         echo ""
         echo "$MARK_START"
         echo "-- Pick a tool (editor / agent / preset), then a project directory."
-        echo "o.bind(\"$KEY\", \"Open project\", \"devopen menu\")"
+        echo "-- Bound by full path, so the key runs this checkout and not"
+        echo "-- whatever else a shell profile might put on PATH as \"devopen\"."
+        echo "o.bind(\"$KEY\", \"Open project\", \"$REPO/bin/devopen menu\")"
         echo "$MARK_END"
       } >>"$BINDINGS"
-      say "keybind    $KEY -> devopen menu (backup alongside)"
+      say "keybind    $KEY -> $REPO/bin/devopen menu (backup alongside)"
     fi
   else
     say "keybind    $BINDINGS not found; add manually:"
-    say "           o.bind(\"$KEY\", \"Open project\", \"devopen menu\")"
+    say "           o.bind(\"$KEY\", \"Open project\", \"$REPO/bin/devopen menu\")"
   fi
 fi
 

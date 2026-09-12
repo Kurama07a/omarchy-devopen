@@ -126,6 +126,27 @@ Three sources are merged, deduplicated, and shown in this order:
 `depth` is per root and counts from that root. The `fd` sweep is cached for
 `cacheTtl` seconds; zoxide is always read live.
 
+`scan.maxDirs` (default 5000) caps the list a sweep can produce and
+`scan.timeout` (default 20s) caps how long one may run; `menu.maxRows`
+(default 500) caps how many rows a picker is handed.
+
+### Where devopen finds its own tools
+
+```json
+"security": {
+  "toolPath": "/usr/share/omarchy/bin:/usr/local/bin:/usr/bin:/bin"
+}
+```
+
+devopen resolves `jq`, `fd`, the omarchy menu helpers and every other program
+it runs *for itself* inside this list, and nowhere else — your `PATH` is not
+consulted. The default covers a normal Omarchy install; set it only if yours
+keeps those helpers somewhere else. `devopen doctor` prints the list, flags any
+entry that is group- or world-writable, and shows where each tool resolved to.
+
+This does not apply to the tools *you* configure — those are found on your own
+`PATH`, wherever you keep them. See [Security notes](#security-notes).
+
 ### Tools
 
 ```json
@@ -188,7 +209,28 @@ and the launchers stubbed — nothing touches your real config or opens a window
 
 ## Security notes
 
-Everything below is enforced by a test in the `security` group.
+Everything below is enforced by a test in the `security` or `hardening` group.
+
+- **A planted binary cannot become one of devopen's own tools.** `jq`, `fd`,
+  `sed`, `awk`, `setsid`, `uwsm-app` and the omarchy menu helpers are
+  implementation detail you never asked for, so they are not looked up through
+  an inherited `PATH` — where anything earlier in the list wins. devopen
+  rebuilds its environment on startup (dropping `LD_PRELOAD`, `BASH_ENV` and
+  everything else not on a short allowlist) and resolves each tool to an
+  absolute path inside `security.toolPath`. The bar widget starts the script
+  with an argv array rather than a command string, so no shell — and no
+  profile-sourcing login shell — sits between the click and the script.
+- **What you configured is still launched as you.** A `command` in
+  `config.json` goes to the session's own app daemon and runs with the session
+  environment, exactly as the app launcher would run it. Locking that down
+  would buy nothing — `config.json` can already name any command at all, so it
+  sits at the same trust level as your shell profile — and would break every
+  editor living in `~/.local/bin` or a version manager's shim directory. The
+  boundary is *which* program runs, not whose tools they are.
+- **Scans and menus are bounded.** `scan.maxDirs` caps how many directories a
+  sweep can ever produce, `menu.maxRows` caps how long a menu can get, and
+  `scan.timeout` gives every `fd`/`zoxide` sweep a wall-clock ceiling, so a
+  symlink loop or a stalled network mount cannot wedge the bar.
 
 - **Directory names are never interpolated into a shell command.** Paths reach
   the launcher through `printf %q`, so a directory called

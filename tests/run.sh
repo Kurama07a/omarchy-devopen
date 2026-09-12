@@ -147,8 +147,15 @@ new_env() { # new_env <config-json>
   if [[ -n ${1-} ]]; then printf '%s' "$1" >"$ENVDIR/config/devopen/config.json"; fi
 }
 
+# devopen rebuilds its environment and resolves its own tools inside a fixed
+# list of trusted directories, so the stub launchers are reached the way a
+# non-standard install would reach them: by naming the directory in the config,
+# not by leaning on an inherited PATH.
+STUB_TOOL_PATH="$STUB:/usr/share/omarchy/bin:/usr/local/bin:/usr/bin:/bin"
+
 basic_config() {
-  jq -n --arg tree "$TREE" '{
+  jq -n --arg tree "$TREE" --arg toolpath "$STUB_TOOL_PATH" '{
+    security: { toolPath: $toolpath },
     scan: { roots: [{path:$tree, depth:2}], gitRepos:true, allDirs:true, zoxide:false, cacheTtl:120,
             ignore:["node_modules"] },
     pinned: [],
@@ -619,7 +626,98 @@ EOF
   wait_lines "$TMP/cwd.log" 1
   assert_contains "where flow works" "$TREE/repo-a" "$(cat "$TMP/cwd.log" 2>/dev/null)"
 
+
+  # a menu is never handed an unbounded list, whatever the config adds up to
+  new_env "$(basic_config | jq '.menu.maxRows = 2')"
+  : >"$DEVOPEN_ROWS_FILE"
+  DEVOPEN_PICK="__nothing__" "$DEVOPEN" menu >/dev/null 2>&1
+  assert_eq "menu.maxRows caps the tool picker" "2" "$(grep -c . "$DEVOPEN_ROWS_FILE")"
+
   rm -f "$STUB/omarchy-menu-select" "$STUB/omarchy-menu-input"
+
+
+# =============================================================== hardening ==
+#
+# devopen resolves its own machinery inside an explicit list of trusted
+# directories, under an environment it builds rather than inherits. What you
+# configured is still launched as you: the boundary is which program runs, not
+# whose tools they are.
+
+group "hardening"
+
+  PLANT="$TMP/plant"
+  mkdir -p "$PLANT"
+  cat >"$PLANT/fd" <<EOF
+#!/bin/bash
+touch "$TMP/PLANTED_FD"
+EOF
+  cat >"$PLANT/jq" <<EOF
+#!/bin/bash
+touch "$TMP/PLANTED_JQ"
+exec /usr/bin/jq "\$@"
+EOF
+  chmod +x "$PLANT/fd" "$PLANT/jq"
+
+  # --- a binary planted earlier on PATH is not what gets run --------------
+  new_env "$(basic_config)"
+  rm -f "$TMP/PLANTED_FD" "$TMP/PLANTED_JQ"
+  out=$(PATH="$PLANT:$PATH" "$DEVOPEN" dirs --force 2>/dev/null)
+  assert_no_file "planted fd earlier on PATH is not used" "$TMP/PLANTED_FD"
+  assert_no_file "planted jq earlier on PATH is not used" "$TMP/PLANTED_JQ"
+  assert_contains "the real fd still ran" "repo-a" "$out"
+
+  # --- the environment is rebuilt, not inherited --------------------------
+  cat >"$STUB/envdump" <<'EOF'
+#!/bin/bash
+env >"$DEVOPEN_ENV_DUMP"
+EOF
+  chmod +x "$STUB/envdump"
+  export DEVOPEN_ENV_DUMP="$TMP/env.dump"
+
+  new_env "$(basic_config | jq '.tools.envd = {label:"Envd",icon:"E",description:"dumps env",type:"gui",command:"envdump"}')"
+  rm -f "$DEVOPEN_ENV_DUMP"
+  SNEAKY_VAR=hello LD_PRELOAD=/nonexistent/evil.so BASH_ENV=/nonexistent/rc.sh \
+    "$DEVOPEN" open envd "$TREE/plain" >/dev/null 2>&1
+  wait_lines "$DEVOPEN_ENV_DUMP" 1
+  dump=$(cat "$DEVOPEN_ENV_DUMP" 2>/dev/null)
+  assert_not_contains "unlisted variable dropped"  "SNEAKY_VAR" "$dump"
+  assert_not_contains "LD_PRELOAD dropped"         "LD_PRELOAD" "$dump"
+  assert_not_contains "BASH_ENV dropped"           "BASH_ENV"   "$dump"
+  assert_not_contains "caller PATH is not ours"    "$PLANT"     "$dump"
+  assert_contains     "HOME is kept"               "HOME="      "$dump"
+  assert_contains     "XDG sandbox is kept"        "XDG_CONFIG_HOME=" "$dump"
+
+  # --- launches go to absolute paths, through a plain shell ---------------
+  new_env "$(basic_config)"
+  out=$(DEVOPEN_DRY_RUN=1 "$DEVOPEN" open rec "$TREE/plain" 2>&1)
+  assert_contains     "launcher called by absolute path" "$STUB/omarchy-launch-tui" "$out"
+  assert_contains     "shell is a plain -c"              " -c "  " $out "
+  assert_not_contains "no login shell sources a profile" " -lc " " $out "
+
+  # --- scans are bounded --------------------------------------------------
+  new_env "$(basic_config | jq '.scan.maxDirs = 3')"
+  assert_eq "scan.maxDirs caps the directory list" "3" "$("$DEVOPEN" dirs --force | grep -c .)"
+
+  # --- what counts as a tool ----------------------------------------------
+  : >"$STUB/notexec"
+  chmod 644 "$STUB/notexec"
+  new_env "$(basic_config)"
+  load_lib
+  assert_rc "resolve_bin finds a trusted tool"      0 resolve_bin jq
+  assert_rc "resolve_bin rejects a path"            1 resolve_bin /usr/bin/jq
+  assert_rc "resolve_bin rejects a traversal"       1 resolve_bin ../../usr/bin/jq
+  assert_rc "resolve_bin rejects a non-executable"  1 resolve_bin notexec
+  assert_rc "resolve_bin rejects the unknown"       1 resolve_bin definitely-not-a-tool-xyz
+  rm -f "$STUB/notexec" "$STUB/envdump"
+
+  # your own tools are still found on your own PATH, wherever they live
+  assert_rc "configured tool found on user PATH" 0 tool_available rec
+  assert_rc "missing tool still reported missing" 1 tool_available nope
+
+  # --- the widget hands over argv, not a command line ---------------------
+  qml=$(cat "$REPO/BarWidget.qml")
+  assert_contains     "widget launches via argv"        "Quickshell.execDetached" "$qml"
+  assert_not_contains "widget builds no shell string"   "root.bar.run" "$qml"
 
 # ================================================================== install ==
 

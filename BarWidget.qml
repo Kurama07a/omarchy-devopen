@@ -1,4 +1,5 @@
 import QtQuick
+import Quickshell
 import qs.Ui
 
 // Bar entry point for devopen. The picking, scanning and launching all live in
@@ -8,6 +9,13 @@ import qs.Ui
 // The script is addressed by its path inside this plugin folder rather than by
 // name, so the widget works as soon as the plugin is added — before install.sh
 // has put `devopen` on PATH, and regardless of what PATH the shell inherited.
+//
+// It is started with execDetached's argv form rather than bar.run(), because
+// bar.run() takes a command *string* and hands it to `bash -lc` — a login shell
+// that sources your profile, and so resolves everything downstream through
+// whatever PATH that profile builds. Passing argv means no shell parses this
+// line at all: no quoting to get right, no profile sourced, and nothing between
+// the click and the script.
 BarWidget {
   id: root
   moduleName: "io.github.kurama07a.devopen"
@@ -26,9 +34,7 @@ BarWidget {
     tooltipText: "Open a project — right-click to pick the folder first"
 
     onPressed: function(mouseButton) {
-      if (!root.bar) return
-      var quoted = "'" + root.cli.replace(/'/g, "'\\''") + "'"
-      root.bar.run(quoted + (mouseButton === Qt.RightButton ? " where" : " menu"))
+      Quickshell.execDetached([root.cli, mouseButton === Qt.RightButton ? "where" : "menu"])
     }
   }
 }
