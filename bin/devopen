@@ -44,12 +44,26 @@ ENV_KEEP=(
   XDG_CURRENT_DESKTOP XDG_SESSION_TYPE
   WAYLAND_DISPLAY HYPRLAND_INSTANCE_SIGNATURE DISPLAY XAUTHORITY
   DBUS_SESSION_BUS_ADDRESS
+  # omarchy-menu-select shells out to omarchy-shell, which refuses to start
+  # without OMARCHY_PATH. Drop it and every menu dies with "OMARCHY_PATH is
+  # not set" on stderr nobody reads - the picker just never appears.
+  OMARCHY_PATH OMARCHY_SHELL_IPC_TIMEOUT
   EDITOR
 )
 
 # Re-exec once under a closed environment. DEVOPEN_USER_PATH carries the PATH we
 # were called with; it is never used to find anything this script runs, only to
 # answer "is the tool you configured installed?" when building the picker.
+#
+# This is the inner layer. It cannot be the only one: LD_PRELOAD is acted on by
+# the dynamic loader, and BASH_ENV sourced by bash, before this line is ever
+# reached. The bar widget and the installed keybinding therefore start a fixed
+# interpreter with an already-cleared environment (see BarWidget.qml), and this
+# seal stays as defence in depth for every other way the script can be invoked.
+#
+# A caller that has already built a clean environment can hand us the user's
+# real PATH under DEVOPEN_USER_PATH; honour it rather than reading it back off
+# the PATH we were given, which in that case is the trusted list, not theirs.
 if [[ -z ${DEVOPEN_LIB_ONLY-} && -z ${DEVOPEN_SEALED-} ]]; then
   _self="${BASH_SOURCE[0]}"
   [[ $_self == /* ]] || _self="$PWD/$_self"
@@ -61,7 +75,8 @@ if [[ -z ${DEVOPEN_LIB_ONLY-} && -z ${DEVOPEN_SEALED-} ]]; then
   done
   [[ -n $_env ]] || { printf 'devopen: no env(1) in a trusted directory\n' >&2; exit 1; }
 
-  _keep=(DEVOPEN_SEALED=1 "DEVOPEN_USER_PATH=${PATH-}" "PATH=$DEFAULT_TOOL_PATH")
+  _keep=(DEVOPEN_SEALED=1 "DEVOPEN_USER_PATH=${DEVOPEN_USER_PATH:-${PATH-}}" \
+         "PATH=$DEFAULT_TOOL_PATH")
   for _v in "${ENV_KEEP[@]}"; do
     [[ -n ${!_v+x} ]] && _keep+=("$_v=${!_v}")
   done
@@ -79,7 +94,7 @@ fi
 # opens - both of which are about your tools, not ours.
 USER_PATH="${DEVOPEN_USER_PATH:-${PATH-}}"
 
-VERSION="1.1.0"
+VERSION="1.1.1"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/devopen"
 CONFIG_FILE="$CONFIG_DIR/config.json"
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/devopen"

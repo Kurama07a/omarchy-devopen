@@ -677,10 +677,16 @@ EOF
   new_env "$(basic_config | jq '.tools.envd = {label:"Envd",icon:"E",description:"dumps env",type:"gui",command:"envdump"}')"
   rm -f "$DEVOPEN_ENV_DUMP"
   SNEAKY_VAR=hello LD_PRELOAD=/nonexistent/evil.so BASH_ENV=/nonexistent/rc.sh \
+    OMARCHY_PATH=/opt/omarchy-test \
     "$DEVOPEN" open envd "$TREE/plain" >/dev/null 2>&1
   wait_lines "$DEVOPEN_ENV_DUMP" 1
   dump=$(cat "$DEVOPEN_ENV_DUMP" 2>/dev/null)
   assert_not_contains "unlisted variable dropped"  "SNEAKY_VAR" "$dump"
+  # OMARCHY_PATH must survive: omarchy-menu-select shells out to omarchy-shell,
+  # which exits with "OMARCHY_PATH is not set" without it — and because that
+  # goes to a stderr nobody reads, the only symptom is a picker that never
+  # appears. Sealing the environment broke exactly this once already.
+  assert_contains     "OMARCHY_PATH survives the seal" "OMARCHY_PATH=/opt/omarchy-test" "$dump"
   assert_not_contains "LD_PRELOAD dropped"         "LD_PRELOAD" "$dump"
   assert_not_contains "BASH_ENV dropped"           "BASH_ENV"   "$dump"
   assert_not_contains "caller PATH is not ours"    "$PLANT"     "$dump"
@@ -714,10 +720,25 @@ EOF
   assert_rc "configured tool found on user PATH" 0 tool_available rec
   assert_rc "missing tool still reported missing" 1 tool_available nope
 
-  # --- the widget hands over argv, not a command line ---------------------
+  # --- the widget starts a fixed interpreter with a cleared environment ---
+  #
+  # The seal inside the script cannot be the outer defence: LD_PRELOAD is acted
+  # on by the loader, and BASH_ENV sourced by bash, before the script's first
+  # line runs. So the widget must name the interpreter itself and clear the
+  # environment before it starts.
   qml=$(cat "$REPO/BarWidget.qml")
-  assert_contains     "widget launches via argv"        "Quickshell.execDetached" "$qml"
+  assert_contains     "widget clears the environment"   "clearEnvironment: true" "$qml"
+  assert_contains     "widget names a fixed interpreter" 'interpreter: "/usr/bin/bash"' "$qml"
+  assert_contains     "widget passes the script as argv" "root.interpreter," "$qml"
+  assert_contains     "widget launches detached"        "startDetached()" "$qml"
   assert_not_contains "widget builds no shell string"   "root.bar.run" "$qml"
+  assert_not_contains "widget uses no login shell"      '"-lc"' "$qml"
+  assert_contains     "widget forwards OMARCHY_PATH"    '"OMARCHY_PATH"' "$qml"
+
+  # the installed keybinding must not rely on the shebang either
+  inst_sh=$(cat "$REPO/install.sh")
+  assert_contains "keybind drops BASH_ENV"   "-u BASH_ENV"   "$inst_sh"
+  assert_contains "keybind drops LD_PRELOAD" "-u LD_PRELOAD" "$inst_sh"
 
 # ================================================================== install ==
 
@@ -749,6 +770,11 @@ EOF
   assert_eq   "install: bar widget added" "1" \
     "$(jq '[.bar.layout.left[] | select(.id=="io.github.kurama07a.devopen")] | length' "$FAKE/.config/omarchy/shell.json")"
   assert_contains "install: keybind block added" ">>> devopen" "$(cat "$FAKE/.config/hypr/bindings.lua")"
+  # the written binding must name an interpreter and drop the pre-seal vars
+  bindline=$(grep -F 'o.bind' "$FAKE/.config/hypr/bindings.lua" | grep -F 'Open project')
+  assert_contains "install: keybind names an interpreter" "/usr/bin/bash $REPO/bin/devopen" "$bindline"
+  assert_contains "install: keybind drops BASH_ENV"       "-u BASH_ENV"   "$bindline"
+  assert_contains "install: keybind drops LD_PRELOAD"     "-u LD_PRELOAD" "$bindline"
   assert_eq "install: shell.json still valid json" "0" \
     "$(jq -e . "$FAKE/.config/omarchy/shell.json" >/dev/null 2>&1; echo $?)"
 

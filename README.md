@@ -211,6 +211,15 @@ and the launchers stubbed — nothing touches your real config or opens a window
 
 Everything below is enforced by a test in the `security` or `hardening` group.
 
+- **The environment is cleared before the interpreter starts, not after.**
+  `LD_PRELOAD` is acted on by the dynamic loader and `BASH_ENV` is sourced by
+  bash *before* a script's first line, so a seal inside `devopen` can never be
+  the outer defence. The bar widget names a fixed, root-owned interpreter
+  (`/usr/bin/bash`), passes the script to it as an argument, and starts it with
+  `clearEnvironment: true` plus an explicit allowlist — so nothing inherited
+  from the shell that launched Quickshell reaches it. The installed keybinding
+  does the same through `env -u`. The script's own re-exec stays as defence in
+  depth for every other way it can be invoked.
 - **A planted binary cannot become one of devopen's own tools.** `jq`, `fd`,
   `sed`, `awk`, `setsid`, `uwsm-app` and the omarchy menu helpers are
   implementation detail you never asked for, so they are not looked up through

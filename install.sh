@@ -97,6 +97,14 @@ fi
 # --- 4. keybinding -----------------------------------------------------------
 # The block is fenced with markers so uninstall removes exactly what was added
 # here and never a binding you wrote yourself.
+# What the key actually runs. A named interpreter at an absolute path, so the
+# binding never depends on PATH or on the script's shebang being reached with a
+# sane environment; and `env -u` strips the variables the loader and bash act on
+# *before* the script's own seal can run. The bar widget does this properly with
+# a full allowlist (see BarWidget.qml) — a static binding string cannot forward
+# WAYLAND_DISPLAY and friends by name, so it drops the dangerous ones instead.
+LAUNCH="/usr/bin/env -u BASH_ENV -u ENV -u LD_PRELOAD -u LD_LIBRARY_PATH -u LD_AUDIT -u SHELLOPTS -u BASHOPTS /usr/bin/bash $REPO/bin/devopen"
+
 MARK_START="-- >>> devopen (managed by install.sh) >>>"
 MARK_END="-- <<< devopen (managed by install.sh) <<<"
 
@@ -110,16 +118,18 @@ if ((WITH_KEYBINDING)); then
         echo ""
         echo "$MARK_START"
         echo "-- Pick a tool (editor / agent / preset), then a project directory."
-        echo "-- Bound by full path, so the key runs this checkout and not"
-        echo "-- whatever else a shell profile might put on PATH as \"devopen\"."
-        echo "o.bind(\"$KEY\", \"Open project\", \"$REPO/bin/devopen menu\")"
+        echo "-- Run through a named interpreter at a full path, so the key runs"
+        echo "-- this checkout and not whatever else a shell profile might put on"
+        echo "-- PATH as \"devopen\". env(1) drops the variables that would"
+        echo "-- otherwise be acted on before the script gets to seal itself."
+        echo "o.bind(\"$KEY\", \"Open project\", \"$LAUNCH menu\")"
         echo "$MARK_END"
       } >>"$BINDINGS"
       say "keybind    $KEY -> $REPO/bin/devopen menu (backup alongside)"
     fi
   else
     say "keybind    $BINDINGS not found; add manually:"
-    say "           o.bind(\"$KEY\", \"Open project\", \"$REPO/bin/devopen menu\")"
+    say "           o.bind(\"$KEY\", \"Open project\", \"$LAUNCH menu\")"
   fi
 fi
 
